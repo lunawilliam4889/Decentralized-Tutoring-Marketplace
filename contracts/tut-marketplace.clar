@@ -114,3 +114,67 @@
     (ok (var-set platform-fee new-fee))
   )
 )
+
+
+(define-constant err-invalid-rating (err u108))
+(define-constant err-already-rated (err u109))
+
+(define-map session-ratings uint 
+  {
+    rated: bool,
+    rating: uint
+  }
+)
+
+(define-public (rate-tutor (session-id uint) (rating uint))
+  (let 
+    (
+      (session (unwrap! (map-get? sessions session-id) err-session-not-found))
+      (tutor-data (unwrap! (map-get? tutors (get tutor session)) err-not-tutor))
+      (rating-data (default-to {rated: false, rating: u0} (map-get? session-ratings session-id)))
+    )
+    (asserts! (is-eq (get student session) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status session) "completed") err-not-in-session)
+    (asserts! (not (get rated rating-data)) err-already-rated)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    
+    (let ((new-rating (/ (+ (* (get rating tutor-data) (get total-sessions tutor-data)) rating) (+ (get total-sessions tutor-data) u1))))
+      (map-set tutors (get tutor session) (merge tutor-data 
+        { 
+          rating: new-rating,
+          total-sessions: (+ (get total-sessions tutor-data) u1)
+        }
+      ))
+      (map-set session-ratings session-id {rated: true, rating: rating})
+      (ok new-rating)
+    )
+  )
+)
+
+
+(define-constant err-no-content (err u110))
+
+(define-map session-content uint
+  {
+    materials-url: (string-ascii 256),
+    notes: (string-ascii 500)
+  }
+)
+
+(define-public (add-session-content (session-id uint) (materials-url (string-ascii 256)) (notes (string-ascii 500)))
+  (let ((session (unwrap! (map-get? sessions session-id) err-session-not-found)))
+    (asserts! (is-eq (get tutor session) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status session) "completed") err-not-in-session)
+    (asserts! (not (is-eq materials-url "")) err-no-content)
+    (ok (map-set session-content session-id
+      {
+        materials-url: materials-url,
+        notes: notes
+      }
+    ))
+  )
+)
+
+(define-read-only (get-session-content (session-id uint))
+  (map-get? session-content session-id)
+)
