@@ -272,6 +272,139 @@
   (var-get dispute-window)
 )
 
+(define-constant err-invalid-plan (err u116))
+(define-constant err-subscription-not-found (err u117))
+(define-constant err-subscription-expired (err u118))
+(define-constant err-insufficient-sessions (err u119))
+(define-constant err-plan-not-found (err u120))
+
+(define-data-var subscription-counter uint u0)
+
+(define-map subscription-plans uint
+  {
+    tutor: principal,
+    sessions-count: uint,
+    duration-blocks: uint,
+    price: uint,
+    discount-rate: uint,
+    active: bool
+  }
+)
+
+(define-map user-subscriptions uint
+  {
+    student: principal,
+    plan-id: uint,
+    sessions-remaining: uint,
+    expires-at: uint,
+    purchased-at: uint
+  }
+)
+
+(define-public (create-subscription-plan (sessions-count uint) (duration-blocks uint) (discount-rate uint))
+  (let 
+    (
+      (tutor-data (unwrap! (map-get? tutors tx-sender) err-not-tutor))
+      (plan-id (+ (var-get subscription-counter) u1))
+      (base-price (* (get hourly-rate tutor-data) sessions-count))
+      (discounted-price (- base-price (/ (* base-price discount-rate) u100)))
+    )
+    (asserts! (>= sessions-count u3) err-invalid-plan)
+    (asserts! (>= duration-blocks u1440) err-invalid-plan)
+    (asserts! (and (>= discount-rate u5) (<= discount-rate u50)) err-invalid-plan)
+    (var-set subscription-counter plan-id)
+    (ok (map-set subscription-plans plan-id
+      {
+        tutor: tx-sender,
+        sessions-count: sessions-count,
+        duration-blocks: duration-blocks,
+        price: discounted-price,
+        discount-rate: discount-rate,
+        active: true
+      }
+    ))
+  )
+)
+
+(define-public (deactivate-subscription-plan (plan-id uint))
+  (let ((plan (unwrap! (map-get? subscription-plans plan-id) err-plan-not-found)))
+    (asserts! (is-eq (get tutor plan) tx-sender) err-unauthorized)
+    (ok (map-set subscription-plans plan-id (merge plan { active: false })))
+  )
+)
+
+(define-public (purchase-subscription (plan-id uint))
+  (let 
+    (
+      (plan (unwrap! (map-get? subscription-plans plan-id) err-plan-not-found))
+      (subscription-id (+ (var-get subscription-counter) u1))
+      (expires-at (+ stacks-block-height (get duration-blocks plan)))
+    )
+    (asserts! (get active plan) err-invalid-plan)
+    (asserts! (>= (stx-get-balance tx-sender) (get price plan)) err-invalid-amount)
+    (try! (stx-transfer? (get price plan) tx-sender (as-contract tx-sender)))
+    (var-set subscription-counter subscription-id)
+    (ok (map-set user-subscriptions subscription-id
+      {
+        student: tx-sender,
+        plan-id: plan-id,
+        sessions-remaining: (get sessions-count plan),
+        expires-at: expires-at,
+        purchased-at: stacks-block-height
+      }
+    ))
+  )
+)
+
+(define-public (book-session-with-subscription (subscription-id uint) (tutor principal))
+  (let 
+    (
+      (subscription (unwrap! (map-get? user-subscriptions subscription-id) err-subscription-not-found))
+      (plan (unwrap! (map-get? subscription-plans (get plan-id subscription)) err-plan-not-found))
+      (session-id (+ (var-get session-counter) u1))
+    )
+    (asserts! (is-eq (get student subscription) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get tutor plan) tutor) err-unauthorized)
+    (asserts! (> (get expires-at subscription) stacks-block-height) err-subscription-expired)
+    (asserts! (> (get sessions-remaining subscription) u0) err-insufficient-sessions)
+    (var-set session-counter session-id)
+    (map-set user-subscriptions subscription-id (merge subscription 
+      { sessions-remaining: (- (get sessions-remaining subscription) u1) }
+    ))
+    (ok (map-set sessions session-id
+      {
+        tutor: tutor,
+        student: tx-sender,
+        amount: u0,
+        status: "pending",
+        timestamp: stacks-block-height
+      }
+    ))
+  )
+)
+
+(define-public (release-subscription-payment (subscription-id uint))
+  (let 
+    (
+      (subscription (unwrap! (map-get? user-subscriptions subscription-id) err-subscription-not-found))
+      (plan (unwrap! (map-get? subscription-plans (get plan-id subscription)) err-plan-not-found))
+      (fee (/ (* (get price plan) (var-get platform-fee)) u1000))
+    )
+    (asserts! (> (get expires-at subscription) stacks-block-height) err-subscription-expired)
+    (try! (as-contract (stx-transfer? (- (get price plan) fee) tx-sender (get tutor plan))))
+    (try! (as-contract (stx-transfer? fee tx-sender contract-owner)))
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription-plan (plan-id uint))
+  (map-get? subscription-plans plan-id)
+)
+
+(define-read-only (get-user-subscription (subscription-id uint))
+  (map-get? user-subscriptions subscription-id)
+)
+
 (define-public (complete-session-new (session-id uint))
   (let ((session (unwrap! (map-get? sessions session-id) err-session-not-found)))
     (asserts! (is-eq (get tutor session) tx-sender) err-unauthorized)
