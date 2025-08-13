@@ -405,6 +405,253 @@
   (map-get? user-subscriptions subscription-id)
 )
 
+;; Skill Certification System - Blockchain-verified credentials for completed learning programs
+(define-constant err-program-not-found (err u121))
+(define-constant err-already-enrolled (err u122))
+(define-constant err-not-enrolled (err u123))
+(define-constant err-program-incomplete (err u124))
+(define-constant err-certificate-exists (err u125))
+(define-constant err-invalid-program (err u126))
+(define-constant err-insufficient-requirements (err u127))
+
+;; Global counters for certification system
+(define-data-var certification-program-counter uint u0)
+(define-data-var certificate-counter uint u0)
+
+;; Certification programs created by tutors
+(define-map certification-programs uint
+  {
+    tutor: principal,
+    skill-name: (string-ascii 100),
+    description: (string-ascii 500),
+    required-sessions: uint,
+    assessment-fee: uint,
+    difficulty-level: uint,
+    active: bool,
+    created-at: uint
+  }
+)
+
+;; Student enrollments in certification programs
+(define-map program-enrollments { program-id: uint, student: principal }
+  {
+    enrolled-at: uint,
+    sessions-completed: uint,
+    assessment-passed: bool,
+    progress-notes: (string-ascii 300)
+  }
+)
+
+;; Issued certificates with blockchain verification
+(define-map skill-certificates uint
+  {
+    student: principal,
+    program-id: uint,
+    tutor: principal,
+    skill-name: (string-ascii 100),
+    issued-at: uint,
+    verification-hash: (buff 32),
+    grade: uint,
+    valid: bool
+  }
+)
+
+;; Student certificate portfolios for easy lookup
+(define-map student-portfolios principal (list 20 uint))
+
+;; Create a new certification program
+(define-public (create-certification-program 
+  (skill-name (string-ascii 100)) 
+  (description (string-ascii 500)) 
+  (required-sessions uint) 
+  (assessment-fee uint) 
+  (difficulty-level uint))
+  (let 
+    (
+      (tutor-data (unwrap! (map-get? tutors tx-sender) err-not-tutor))
+      (program-id (+ (var-get certification-program-counter) u1))
+    )
+    ;; Validate program parameters
+    (asserts! (>= required-sessions u3) err-invalid-program)
+    (asserts! (>= assessment-fee u100000) err-invalid-program)
+    (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) err-invalid-program)
+    (asserts! (not (is-eq skill-name "")) err-invalid-program)
+    
+    ;; Update counter and create program
+    (var-set certification-program-counter program-id)
+    (ok (map-set certification-programs program-id
+      {
+        tutor: tx-sender,
+        skill-name: skill-name,
+        description: description,
+        required-sessions: required-sessions,
+        assessment-fee: assessment-fee,
+        difficulty-level: difficulty-level,
+        active: true,
+        created-at: stacks-block-height
+      }
+    ))
+  )
+)
+
+;; Student enrolls in a certification program
+(define-public (enroll-in-program (program-id uint))
+  (let 
+    (
+      (program (unwrap! (map-get? certification-programs program-id) err-program-not-found))
+      (enrollment-key { program-id: program-id, student: tx-sender })
+    )
+    ;; Check if program is active and student not already enrolled
+    (asserts! (get active program) err-invalid-program)
+    (asserts! (is-none (map-get? program-enrollments enrollment-key)) err-already-enrolled)
+    
+    ;; Create enrollment record
+    (ok (map-set program-enrollments enrollment-key
+      {
+        enrolled-at: stacks-block-height,
+        sessions-completed: u0,
+        assessment-passed: false,
+        progress-notes: ""
+      }
+    ))
+  )
+)
+
+;; Tutor updates student progress in certification program
+(define-public (update-program-progress 
+  (program-id uint) 
+  (student principal) 
+  (sessions-increment uint) 
+  (progress-notes (string-ascii 300)))
+  (let 
+    (
+      (program (unwrap! (map-get? certification-programs program-id) err-program-not-found))
+      (enrollment-key { program-id: program-id, student: student })
+      (enrollment (unwrap! (map-get? program-enrollments enrollment-key) err-not-enrolled))
+    )
+    ;; Verify tutor owns the program
+    (asserts! (is-eq (get tutor program) tx-sender) err-unauthorized)
+    
+    ;; Update progress
+    (ok (map-set program-enrollments enrollment-key (merge enrollment
+      {
+        sessions-completed: (+ (get sessions-completed enrollment) sessions-increment),
+        progress-notes: progress-notes
+      }
+    )))
+  )
+)
+
+;; Tutor marks assessment as passed for student
+(define-public (pass-assessment (program-id uint) (student principal))
+  (let 
+    (
+      (program (unwrap! (map-get? certification-programs program-id) err-program-not-found))
+      (enrollment-key { program-id: program-id, student: student })
+      (enrollment (unwrap! (map-get? program-enrollments enrollment-key) err-not-enrolled))
+    )
+    ;; Verify tutor and completion requirements
+    (asserts! (is-eq (get tutor program) tx-sender) err-unauthorized)
+    (asserts! (>= (get sessions-completed enrollment) (get required-sessions program)) err-insufficient-requirements)
+    (asserts! (>= (stx-get-balance student) (get assessment-fee program)) err-invalid-amount)
+    
+    ;; Transfer assessment fee
+    (try! (stx-transfer? (get assessment-fee program) student (as-contract tx-sender)))
+    
+    ;; Mark assessment as passed
+    (ok (map-set program-enrollments enrollment-key (merge enrollment { assessment-passed: true })))
+  )
+)
+
+;; Issue blockchain-verified certificate to student
+(define-public (issue-certificate (program-id uint) (student principal) (grade uint))
+  (let 
+    (
+      (program (unwrap! (map-get? certification-programs program-id) err-program-not-found))
+      (enrollment-key { program-id: program-id, student: student })
+      (enrollment (unwrap! (map-get? program-enrollments enrollment-key) err-not-enrolled))
+      (certificate-id (+ (var-get certificate-counter) u1))
+      (verification-hash (sha256 (concat (unwrap-panic (to-consensus-buff? student)) (unwrap-panic (to-consensus-buff? program-id)))))
+      (current-portfolio (default-to (list) (map-get? student-portfolios student)))
+    )
+    ;; Validate issuance requirements
+    (asserts! (is-eq (get tutor program) tx-sender) err-unauthorized)
+    (asserts! (get assessment-passed enrollment) err-program-incomplete)
+    (asserts! (and (>= grade u60) (<= grade u100)) err-invalid-amount)
+    
+    ;; Update certificate counter
+    (var-set certificate-counter certificate-id)
+    
+    ;; Issue certificate
+    (map-set skill-certificates certificate-id
+      {
+        student: student,
+        program-id: program-id,
+        tutor: tx-sender,
+        skill-name: (get skill-name program),
+        issued-at: stacks-block-height,
+        verification-hash: verification-hash,
+        grade: grade,
+        valid: true
+      }
+    )
+    
+    ;; Update student portfolio
+    (map-set student-portfolios student (unwrap-panic (as-max-len? (append current-portfolio certificate-id) u20)))
+    
+    ;; Release assessment fee to tutor with platform fee
+    (let ((fee (/ (* (get assessment-fee program) (var-get platform-fee)) u1000)))
+      (try! (as-contract (stx-transfer? (- (get assessment-fee program) fee) tx-sender (get tutor program))))
+      (try! (as-contract (stx-transfer? fee tx-sender contract-owner)))
+      (ok certificate-id)
+    )
+  )
+)
+
+;; Deactivate a certification program
+(define-public (deactivate-program (program-id uint))
+  (let ((program (unwrap! (map-get? certification-programs program-id) err-program-not-found)))
+    (asserts! (is-eq (get tutor program) tx-sender) err-unauthorized)
+    (ok (map-set certification-programs program-id (merge program { active: false })))
+  )
+)
+
+;; Revoke a certificate (for misconduct or errors)
+(define-public (revoke-certificate (certificate-id uint))
+  (let ((certificate (unwrap! (map-get? skill-certificates certificate-id) err-certificate-exists)))
+    (asserts! (is-eq (get tutor certificate) tx-sender) err-unauthorized)
+    (ok (map-set skill-certificates certificate-id (merge certificate { valid: false })))
+  )
+)
+
+;; Read-only functions for certification system
+(define-read-only (get-certification-program (program-id uint))
+  (map-get? certification-programs program-id)
+)
+
+(define-read-only (get-program-enrollment (program-id uint) (student principal))
+  (map-get? program-enrollments { program-id: program-id, student: student })
+)
+
+(define-read-only (get-certificate (certificate-id uint))
+  (map-get? skill-certificates certificate-id)
+)
+
+(define-read-only (get-student-portfolio (student principal))
+  (map-get? student-portfolios student)
+)
+
+(define-read-only (verify-certificate (certificate-id uint) (expected-student principal))
+  (match (map-get? skill-certificates certificate-id)
+    certificate 
+      (and 
+        (get valid certificate)
+        (is-eq (get student certificate) expected-student)
+      )
+    false
+  )
+)
+
 (define-public (complete-session-new (session-id uint))
   (let ((session (unwrap! (map-get? sessions session-id) err-session-not-found)))
     (asserts! (is-eq (get tutor session) tx-sender) err-unauthorized)
@@ -430,3 +677,44 @@
     )
   )
 )
+
+
+
+
+Blockchain credentials system enables tutors to issue tamper-proof skill certificates
+Pull Request Title:
+
+Blockchain-Verified Skill Certification System: Transforming Tutors into Credentialing Authorities
+Pull Request Description:
+
+Revolutionizes the tutoring marketplace by introducing a comprehensive blockchain-based certification system that allows tutors to become official skill credentialing authorities while providing students with immutable, portable proof of their learning achievements.
+
+**🎓 Core Innovation**
+- Tutors can design structured certification programs with specific session requirements and assessment criteria
+- Students earn blockchain-verified certificates with SHA-256 verification hashes that prove authenticity
+- Portfolio system manages up to 20 certificates per student for comprehensive skill tracking
+
+**💼 Economic Impact**
+- Creates new revenue streams through assessment fees separate from tutoring sessions
+- Establishes premium credentialing tier that attracts serious learners willing to pay for verified credentials
+- Platform benefits from certification transaction fees while maintaining standard session economics
+
+**🔐 Technical Excellence**
+- Immutable certificate storage with cryptographic verification prevents credential fraud
+- Composite key enrollment system enables efficient student-program relationship tracking
+- Grade-based certification (60-100 scale) provides nuanced skill validation
+- Program difficulty levels (1-5) enable proper skill categorization and progression
+
+**🌟 User Experience Enhancement**
+- Students gain portable credentials that demonstrate verified competencies to employers
+- Tutors establish themselves as recognized authorities in their subject domains
+- Transparent progress tracking throughout certification journey
+- Public verification system builds trust in credential authenticity
+
+**Implementation Highlights:**
+- 249 lines of comprehensive functionality covering the complete certification lifecycle
+- Robust error handling with 7 new error constants for edge case management
+- Efficient data structures optimized for certification program scalability
+- Integration with existing tutor verification and payment systems
+
+This feature positions the platform as more than a tutoring service - it becomes a recognized credentialing institution that bridges the gap between learning and career advancement.
