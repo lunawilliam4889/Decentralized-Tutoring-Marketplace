@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/tut-marketplace.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.session-scheduling]
+path = 'contracts/session-scheduling.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
